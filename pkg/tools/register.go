@@ -16,4 +16,5 @@ func RegisterAll(s *server.MCPServer, client *kentik.Client) {
 	registerUserTools(s, client)
 	registerTagTools(s, client)
 	registerAIAdvisorTools(s, client)
+	registerSNMPTools(s, client)
 }

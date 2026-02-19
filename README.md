@@ -14,7 +14,9 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 | `kentik_list_interfaces` | List interfaces on a device |
 | `kentik_list_all_interfaces` | List interfaces across all devices (bulk, rate-limited) |
 | `kentik_get_interface` | Get interface details |
-| `kentik_query_data` | Query flow data with convenience filters (connect type, port, ASN, IP) and auto-summarization |
+| `kentik_query_data` | Query flow data with convenience filters (connect type, port, ASN, IP), device label/site shortcuts, and auto-summarization |
+| `kentik_query_compare` | Compare traffic volume (bytes) vs flow rate (fps) side-by-side with skew analysis |
+| `kentik_get_interface_counters` | Query per-interface bandwidth with description filtering (e.g. 'pni', 'transit') |
 | `kentik_query_url` | Generate a Kentik portal Data Explorer URL for a query |
 | `kentik_list_synthetic_tests` | List all synthetic monitoring tests |
 | `kentik_get_synthetic_test` | Get synthetic test details |
@@ -122,7 +124,7 @@ Once connected, you can ask your LLM things like:
 
 - "Search for border routers in the NYC site"
 - "Show me the top 10 destination ASNs by traffic on PNI links in the last 24 hours"
-- "What's the traffic breakdown by port on external links (PNI + transit + IX)?"
+- "What's the traffic breakdown by port on external links?"
 - "Query flows per second by destination port, filtered to transit links"
 - "What synthetic tests are configured?"
 - "Ask Kentik AI: How are my devices doing?"

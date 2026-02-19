@@ -85,11 +85,63 @@ func registerQueryTools(s *server.MCPServer, client *kentik.Client) {
 		mcp.WithString("site_name",
 			mcp.Description("Convenience shortcut: auto-resolve devices by site name (e.g. 'NYC-DC1'). Searches for active devices at this site and uses them. Overrides device_name."),
 		),
+		mcp.WithString("device_label",
+			mcp.Description("Convenience shortcut: auto-resolve devices by label (e.g. 'border', 'core'). Searches for active devices with this label and uses them. Overrides device_name."),
+		),
 		mcp.WithString("fast_data",
 			mcp.Description("Dataset selection: Auto, Fast, or Full. Default: Auto"),
 		),
 	)
 	s.AddTool(queryData, makeQueryDataHandler(client))
+
+	// Compare tool: runs bytes + fps queries in parallel and shows skew
+	queryCompare := mcp.NewTool("kentik_query_compare",
+		mcp.WithDescription("Compare traffic volume (bytes) vs flow rate (fps) for the same dimension and filters. Returns a combined table showing traffic %, flow %, and skew per row. Useful for identifying flow-heavy vs volume-heavy dimensions. Note: fps = flows per second (L3/L4 flow records), not HTTP requests."),
+		mcp.WithString("dimension",
+			mcp.Required(),
+			mcp.Description("Group-by dimension. E.g. Port_dst, AS_dst, IP_src, InterfaceID_dst, i_dst_connect_type_name"),
+		),
+		mcp.WithString("device_name",
+			mcp.Description("Comma-delimited list of device names to query."),
+		),
+		mcp.WithString("site_name",
+			mcp.Description("Auto-resolve devices by site name. Overrides device_name."),
+		),
+		mcp.WithString("device_label",
+			mcp.Description("Auto-resolve devices by label. Overrides device_name."),
+		),
+		mcp.WithNumber("lookback_seconds",
+			mcp.Description("Look-back time in seconds. Default: 86400 (24h)"),
+		),
+		mcp.WithNumber("topx",
+			mcp.Description("Number of top results. Default: 15"),
+		),
+		mcp.WithNumber("depth",
+			mcp.Description("Pool size. Default: 100"),
+		),
+		mcp.WithString("dst_connect_type",
+			mcp.Description("Filter: destination connectivity type. E.g. 'free_pni,transit,ix' for external only."),
+		),
+		mcp.WithString("src_connect_type",
+			mcp.Description("Filter: source connectivity type."),
+		),
+		mcp.WithString("port",
+			mcp.Description("Filter: destination port."),
+		),
+		mcp.WithString("dst_as",
+			mcp.Description("Filter: destination AS number."),
+		),
+		mcp.WithString("src_as",
+			mcp.Description("Filter: source AS number."),
+		),
+		mcp.WithString("filters_json",
+			mcp.Description("Optional raw JSON for complex filters."),
+		),
+		mcp.WithBoolean("all_selected",
+			mcp.Description("Query all devices. Default: true"),
+		),
+	)
+	s.AddTool(queryCompare, makeQueryCompareHandler(client))
 
 	queryURL := mcp.NewTool("kentik_query_url",
 		mcp.WithDescription("Generate a Kentik portal URL with Data Explorer configured for the given query parameters. Returns a URL that opens directly in the Kentik portal."),
@@ -291,27 +343,15 @@ func buildFilters(request mcp.CallToolRequest) map[string]interface{} {
 
 func makeQueryDataHandler(client *kentik.Client) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Auto-resolve site_name to device names
-		var siteDeviceNames string
-		if siteName, err := request.RequireString("site_name"); err == nil && siteName != "" {
-			devNames, resolveErr := resolveDevicesBySite(client, siteName)
-			if resolveErr != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("Failed to resolve site '%s': %v", siteName, resolveErr)), nil
-			}
-			if len(devNames) == 0 {
-				return mcp.NewToolResultError(fmt.Sprintf("No active devices found at site matching '%s'", siteName)), nil
-			}
-			siteDeviceNames = strings.Join(devNames, ",")
-		}
+		resolvedDevices := resolveDeviceShortcuts(client, request)
 
 		query, err := buildQueryObject(request)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// Override device_name if site_name was used
-		if siteDeviceNames != "" {
-			query["device_name"] = siteDeviceNames
+		if resolvedDevices != "" {
+			query["device_name"] = resolvedDevices
 			query["all_selected"] = false
 		}
 
@@ -334,6 +374,23 @@ func makeQueryDataHandler(client *kentik.Client) server.ToolHandlerFunc {
 		summary := summarizeQueryResults(data, query)
 		return mcp.NewToolResultText(summary), nil
 	}
+}
+
+// resolveDeviceShortcuts resolves site_name or device_label to device names.
+func resolveDeviceShortcuts(client *kentik.Client, request mcp.CallToolRequest) string {
+	if siteName, err := request.RequireString("site_name"); err == nil && siteName != "" {
+		names, _ := resolveDevicesBySite(client, siteName)
+		if len(names) > 0 {
+			return strings.Join(names, ",")
+		}
+	}
+	if label, err := request.RequireString("device_label"); err == nil && label != "" {
+		names, _ := resolveDevicesByLabel(client, label)
+		if len(names) > 0 {
+			return strings.Join(names, ",")
+		}
+	}
+	return ""
 }
 
 // resolveDevicesBySite fetches all devices and returns names matching the site.
@@ -362,6 +419,255 @@ func resolveDevicesBySite(client *kentik.Client, siteName string) ([]string, err
 		}
 	}
 	return names, nil
+}
+
+// resolveDevicesByLabel fetches all devices and returns names matching the label.
+func resolveDevicesByLabel(client *kentik.Client, label string) ([]string, error) {
+	data, err := client.V5("GET", "/devices", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Devices []struct {
+			Name   string `json:"device_name"`
+			Status string `json:"device_status"`
+			Labels []struct {
+				Name string `json:"name"`
+			} `json:"labels"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	var names []string
+	labelLower := strings.ToLower(label)
+	for _, d := range resp.Devices {
+		if d.Status != "V" {
+			continue
+		}
+		for _, l := range d.Labels {
+			if strings.Contains(strings.ToLower(l.Name), labelLower) {
+				names = append(names, d.Name)
+				break
+			}
+		}
+	}
+	return names, nil
+}
+
+// makeQueryCompareHandler runs bytes + fps queries and produces a skew table.
+func makeQueryCompareHandler(client *kentik.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		resolvedDevices := resolveDeviceShortcuts(client, request)
+
+		// Build base query for bytes
+		bytesQuery, err := buildCompareQuery(request, "bytes")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		fpsQuery, err := buildCompareQuery(request, "fps")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		if resolvedDevices != "" {
+			bytesQuery["device_name"] = resolvedDevices
+			bytesQuery["all_selected"] = false
+			fpsQuery["device_name"] = resolvedDevices
+			fpsQuery["all_selected"] = false
+		}
+
+		mkBody := func(q map[string]interface{}) map[string]interface{} {
+			return map[string]interface{}{
+				"queries": []map[string]interface{}{
+					{"query": q, "bucket": "Left +Y Axis", "bucketIndex": 0, "isOverlay": false},
+				},
+			}
+		}
+
+		// Run both queries
+		bytesData, err := client.V5("POST", "/query/topXdata", mkBody(bytesQuery))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Bytes query failed: %v", err)), nil
+		}
+		fpsData, err := client.V5("POST", "/query/topXdata", mkBody(fpsQuery))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("FPS query failed: %v", err)), nil
+		}
+
+		// Parse results
+		type resultRow struct {
+			Key string
+			Bps float64
+			Fps float64
+		}
+
+		parseResults := func(data json.RawMessage, valKey string) map[string]float64 {
+			var resp struct {
+				Results []struct {
+					Data []map[string]interface{} `json:"data"`
+				} `json:"results"`
+			}
+			m := make(map[string]float64)
+			if err := json.Unmarshal(data, &resp); err != nil || len(resp.Results) == 0 {
+				return m
+			}
+			for _, entry := range resp.Results[0].Data {
+				key := fmt.Sprintf("%v", entry["key"])
+				if v, ok := entry[valKey].(float64); ok {
+					m[key] = v
+				}
+			}
+			return m
+		}
+
+		bytesMap := parseResults(bytesData, "avg_bits_per_sec")
+		fpsMap := parseResults(fpsData, "avg_flows_per_sec")
+
+		// Merge keys
+		allKeys := make(map[string]bool)
+		for k := range bytesMap {
+			allKeys[k] = true
+		}
+		for k := range fpsMap {
+			allKeys[k] = true
+		}
+
+		totalBytes := 0.0
+		totalFps := 0.0
+		for _, v := range bytesMap {
+			totalBytes += v
+		}
+		for _, v := range fpsMap {
+			totalFps += v
+		}
+
+		// Build rows sorted by bytes
+		type row struct {
+			Key      string
+			Bps      float64
+			Fps      float64
+			BytesPct float64
+			FpsPct   float64
+			Skew     float64
+		}
+		var rows []row
+		for k := range allKeys {
+			bps := bytesMap[k]
+			fps := fpsMap[k]
+			bpct := 0.0
+			fpct := 0.0
+			if totalBytes > 0 {
+				bpct = bps / totalBytes * 100
+			}
+			if totalFps > 0 {
+				fpct = fps / totalFps * 100
+			}
+			rows = append(rows, row{k, bps, fps, bpct, fpct, fpct - bpct})
+		}
+		// Sort by bytes descending
+		for i := 0; i < len(rows); i++ {
+			for j := i + 1; j < len(rows); j++ {
+				if rows[j].Bps > rows[i].Bps {
+					rows[i], rows[j] = rows[j], rows[i]
+				}
+			}
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("## Volume vs Flows Comparison (%d keys)\n\n", len(rows)))
+		sb.WriteString(fmt.Sprintf("| %-50s | %14s | %8s | %10s | %8s | %8s |\n",
+			"Key", "Avg bps", "Vol %", "Avg FPS", "Flow %", "Skew"))
+		sb.WriteString("|" + strings.Repeat("-", 52) + "|" + strings.Repeat("-", 16) +
+			"|" + strings.Repeat("-", 10) + "|" + strings.Repeat("-", 12) +
+			"|" + strings.Repeat("-", 10) + "|" + strings.Repeat("-", 10) + "|\n")
+
+		for _, r := range rows {
+			key := r.Key
+			if len(key) > 50 {
+				key = key[:47] + "..."
+			}
+			sign := "+"
+			if r.Skew < 0 {
+				sign = ""
+			}
+			flag := ""
+			if r.Skew > 5 || r.Skew < -5 {
+				flag = " ⚠️"
+			}
+			sb.WriteString(fmt.Sprintf("| %-50s | %14s | %7.1f%% | %10s | %7.1f%% | %s%5.1f%%%s |\n",
+				key, formatBitsPerSec(r.Bps), r.BytesPct,
+				formatRate(r.Fps, "fps"), r.FpsPct,
+				sign, r.Skew, flag))
+		}
+
+		sb.WriteString(fmt.Sprintf("| %-50s | %14s | %7s | %10s | %7s | %8s |\n",
+			"**TOTAL**", formatBitsPerSec(totalBytes), "100.0%",
+			formatRate(totalFps, "fps"), "100.0%", ""))
+
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+}
+
+func buildCompareQuery(request mcp.CallToolRequest, metric string) (map[string]interface{}, error) {
+	dimensionStr, err := request.RequireString("dimension")
+	if err != nil {
+		return nil, err
+	}
+	dimensions := []string{}
+	for _, d := range strings.Split(dimensionStr, ",") {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			dimensions = append(dimensions, d)
+		}
+	}
+
+	lookback := 86400.0
+	if lb, err := request.RequireFloat("lookback_seconds"); err == nil {
+		lookback = lb
+	}
+	topx := 15.0
+	if tx, err := request.RequireFloat("topx"); err == nil {
+		topx = tx
+	}
+	depth := 100.0
+	if dp, err := request.RequireFloat("depth"); err == nil {
+		depth = dp
+	}
+	allSelected := true
+	if val, err := request.RequireString("all_selected"); err == nil && val == "false" {
+		allSelected = false
+	}
+
+	outsort := "avg_bits_per_sec"
+	if metric == "fps" {
+		outsort = "avg_flows_per_sec"
+	}
+
+	query := map[string]interface{}{
+		"metric":           metric,
+		"dimension":        dimensions,
+		"topx":             int(topx),
+		"depth":            int(depth),
+		"fastData":         "Auto",
+		"outsort":          outsort,
+		"lookback_seconds": int(lookback),
+		"time_format":      "UTC",
+		"hostname_lookup":  true,
+		"all_selected":     allSelected,
+	}
+
+	if deviceName, err := request.RequireString("device_name"); err == nil && deviceName != "" {
+		query["device_name"] = deviceName
+		query["all_selected"] = false
+	}
+
+	filtersObj := buildFilters(request)
+	if filtersObj != nil {
+		query["filters_obj"] = filtersObj
+	}
+
+	return query, nil
 }
 
 // summarizeQueryResults produces a human-readable summary table from query results.
