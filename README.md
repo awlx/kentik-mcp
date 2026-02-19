@@ -16,7 +16,15 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 | `kentik_get_interface` | Get interface details |
 | `kentik_query_data` | Query flow data with convenience filters (connect type, port, ASN, IP), device label/site shortcuts, and auto-summarization |
 | `kentik_query_compare` | Compare traffic volume (bytes) vs flow rate (fps) side-by-side with skew analysis |
-| `kentik_get_interface_counters` | Query per-interface bandwidth with description filtering (e.g. 'pni', 'transit') |
+| `kentik_query_toptalkers` | Quick top-talkers query by IP, ASN, port, country, or interface |
+| `kentik_compare_sites` | Compare the same metric across multiple sites side-by-side |
+| `kentik_capacity_plan` | Interface capacity report with utilization and threshold filtering |
+| `kentik_get_interface_counters` | Query per-interface bandwidth with description filtering |
+| `kentik_list_alerts` | List active alerts, alarms, and anomaly detections |
+| `kentik_list_dimensions` | List all available query dimensions with descriptions |
+| `kentik_save_context` | Save a named query context (device group + filters) for reuse |
+| `kentik_list_contexts` | List saved query contexts |
+| `kentik_delete_context` | Delete a saved query context |
 | `kentik_query_url` | Generate a Kentik portal Data Explorer URL for a query |
 | `kentik_list_synthetic_tests` | List all synthetic monitoring tests |
 | `kentik_get_synthetic_test` | Get synthetic test details |
