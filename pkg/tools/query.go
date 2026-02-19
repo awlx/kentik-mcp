@@ -13,17 +13,26 @@ import (
 
 func registerQueryTools(s *server.MCPServer, client *kentik.Client) {
 	queryData := mcp.NewTool("kentik_query_data",
-		mcp.WithDescription("Query Kentik network flow data (topX). Returns JSON results with traffic metrics like bits/sec, packets/sec grouped by dimensions such as source/dest IP, AS, geography, etc. Use lookback_seconds for relative time or starting_time/ending_time for absolute ranges."),
+		mcp.WithDescription("Query Kentik network flow data (topX). Returns JSON results with traffic metrics grouped by dimensions. Includes a human-readable summary table. Use lookback_seconds for relative time or starting_time/ending_time for absolute ranges."),
 		mcp.WithString("metric",
 			mcp.Required(),
 			mcp.Description("Unit of measure: bytes, in_bytes, out_bytes, packets, in_packets, out_packets, tcp_retransmit, fps, unique_src_ip, unique_dst_ip, client_latency, server_latency, appl_latency"),
 		),
 		mcp.WithString("dimension",
 			mcp.Required(),
-			mcp.Description("Group-by dimension(s), comma-separated. Examples: AS_src, AS_dst, Geography_src, Geography_dst, IP_src, IP_dst, Port_src, Port_dst, Proto, Traffic, InterfaceID_src, InterfaceID_dst, TopFlow, i_device_id, i_device_site_name"),
+			mcp.Description("Group-by dimension(s), comma-separated. Common dimensions: "+
+				"AS_src, AS_dst (source/dest ASN), "+
+				"IP_src, IP_dst (source/dest IP), "+
+				"Port_src, Port_dst (source/dest port), "+
+				"Proto (protocol), "+
+				"Geography_src, Geography_dst (country), "+
+				"InterfaceID_src, InterfaceID_dst (interface), "+
+				"i_device_id, i_device_site_name (device/site), "+
+				"i_src_connect_type_name, i_dst_connect_type_name (connectivity type: backbone, free_pni, transit, ix), "+
+				"TopFlow, Traffic"),
 		),
 		mcp.WithNumber("lookback_seconds",
-			mcp.Description("Look-back time in seconds (e.g. 3600 for last hour). Overrides starting_time/ending_time unless set to 0. Default: 3600"),
+			mcp.Description("Look-back time in seconds (e.g. 3600 for last hour, 86400 for last day). Overrides starting_time/ending_time unless set to 0. Default: 3600"),
 		),
 		mcp.WithString("starting_time",
 			mcp.Description("Fixed start time in 'YYYY-MM-DD HH:mm:00' format. Only used when lookback_seconds is 0."),
@@ -32,7 +41,7 @@ func registerQueryTools(s *server.MCPServer, client *kentik.Client) {
 			mcp.Description("Fixed end time in 'YYYY-MM-DD HH:mm:00' format. Only used when lookback_seconds is 0."),
 		),
 		mcp.WithString("device_name",
-			mcp.Description("Comma-delimited list of device names to query. Ignored if all_selected is true."),
+			mcp.Description("Comma-delimited list of device names to query. Ignored if all_selected is true. Use kentik_search_devices to find device names."),
 		),
 		mcp.WithBoolean("all_selected",
 			mcp.Description("Query against all devices. Default: true"),
@@ -47,7 +56,31 @@ func registerQueryTools(s *server.MCPServer, client *kentik.Client) {
 			mcp.Description("Aggregate to sort results by. E.g. avg_bits_per_sec, p95th_bits_per_sec, max_bits_per_sec. Defaults based on metric."),
 		),
 		mcp.WithString("filters_json",
-			mcp.Description("Optional JSON string for filters_obj. Format: {\"connector\":\"All\",\"filterGroups\":[{\"connector\":\"All\",\"filters\":[{\"filterField\":\"dst_as\",\"operator\":\"=\",\"filterValue\":\"15169\"}],\"not\":false}]}"),
+			mcp.Description("Optional raw JSON for filters_obj. Use this for complex filters. Format: {\"connector\":\"All\",\"filterGroups\":[{\"connector\":\"All\",\"filters\":[{\"filterField\":\"dst_as\",\"operator\":\"=\",\"filterValue\":\"15169\"}],\"not\":false}]}"),
+		),
+		mcp.WithString("src_connect_type",
+			mcp.Description("Convenience filter: source connectivity type. Values: backbone, free_pni, transit, ix. Comma-separated for multiple (OR)."),
+		),
+		mcp.WithString("dst_connect_type",
+			mcp.Description("Convenience filter: destination connectivity type. Values: backbone, free_pni, transit, ix. Comma-separated for multiple (OR)."),
+		),
+		mcp.WithString("src_ip",
+			mcp.Description("Convenience filter: source IP address (exact match or CIDR). E.g. '10.0.0.1' or '140.82.112.0/24'."),
+		),
+		mcp.WithString("dst_ip",
+			mcp.Description("Convenience filter: destination IP address (exact match or CIDR)."),
+		),
+		mcp.WithString("port",
+			mcp.Description("Convenience filter: destination port number. E.g. '443' or '22'."),
+		),
+		mcp.WithString("protocol",
+			mcp.Description("Convenience filter: IP protocol number. E.g. '6' for TCP, '17' for UDP."),
+		),
+		mcp.WithString("src_as",
+			mcp.Description("Convenience filter: source AS number. E.g. '15169' for Google."),
+		),
+		mcp.WithString("dst_as",
+			mcp.Description("Convenience filter: destination AS number."),
 		),
 		mcp.WithString("fast_data",
 			mcp.Description("Dataset selection: Auto, Fast, or Full. Default: Auto"),
@@ -162,14 +195,95 @@ func buildQueryObject(request mcp.CallToolRequest) (map[string]interface{}, erro
 		query["ending_time"] = endTime
 	}
 
-	if filtersJSON, err := request.RequireString("filters_json"); err == nil && filtersJSON != "" {
-		var filtersObj map[string]interface{}
-		if err := json.Unmarshal([]byte(filtersJSON), &filtersObj); err == nil {
-			query["filters_obj"] = filtersObj
-		}
+	// Build filters from both raw JSON and convenience params
+	filtersObj := buildFilters(request)
+	if filtersObj != nil {
+		query["filters_obj"] = filtersObj
 	}
 
 	return query, nil
+}
+
+// buildFilters merges raw filters_json with convenience filter parameters.
+func buildFilters(request mcp.CallToolRequest) map[string]interface{} {
+	var filterGroups []map[string]interface{}
+
+	// Parse raw filters_json first
+	if filtersJSON, err := request.RequireString("filters_json"); err == nil && filtersJSON != "" {
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(filtersJSON), &raw); err == nil {
+			if groups, ok := raw["filterGroups"].([]interface{}); ok {
+				for _, g := range groups {
+					if gm, ok := g.(map[string]interface{}); ok {
+						filterGroups = append(filterGroups, gm)
+					}
+				}
+			}
+		}
+	}
+
+	// Convenience filters: each becomes a filter group
+	convenienceFilters := []struct {
+		param string
+		field string
+	}{
+		{"src_connect_type", "i_src_connect_type_name"},
+		{"dst_connect_type", "i_dst_connect_type_name"},
+		{"src_ip", "inet_src_addr"},
+		{"dst_ip", "inet_dst_addr"},
+		{"port", "l4_dst_port"},
+		{"protocol", "protocol"},
+		{"src_as", "src_as"},
+		{"dst_as", "dst_as"},
+	}
+
+	for _, cf := range convenienceFilters {
+		val, err := request.RequireString(cf.param)
+		if err != nil || val == "" {
+			continue
+		}
+
+		// Support comma-separated values as OR
+		values := strings.Split(val, ",")
+		var filters []map[string]interface{}
+		for _, v := range values {
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			op := "="
+			// Use CIDR matching for IP filters with /
+			if strings.Contains(v, "/") && (cf.field == "inet_src_addr" || cf.field == "inet_dst_addr") {
+				op = "ILIKE"
+			}
+			filters = append(filters, map[string]interface{}{
+				"filterField": cf.field,
+				"operator":    op,
+				"filterValue": v,
+			})
+		}
+
+		if len(filters) > 0 {
+			connector := "All"
+			if len(filters) > 1 {
+				connector = "Any"
+			}
+			filterGroups = append(filterGroups, map[string]interface{}{
+				"connector": connector,
+				"filters":   filters,
+				"not":       false,
+			})
+		}
+	}
+
+	if len(filterGroups) == 0 {
+		return nil
+	}
+
+	return map[string]interface{}{
+		"connector":    "All",
+		"filterGroups": filterGroups,
+	}
 }
 
 func makeQueryDataHandler(client *kentik.Client) server.ToolHandlerFunc {
@@ -194,8 +308,166 @@ func makeQueryDataHandler(client *kentik.Client) server.ToolHandlerFunc {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to query data: %v", err)), nil
 		}
-		return mcp.NewToolResultText(formatJSON(data)), nil
+
+		// Build a summary table + raw JSON
+		summary := summarizeQueryResults(data, query)
+		return mcp.NewToolResultText(summary), nil
 	}
+}
+
+// summarizeQueryResults produces a human-readable summary table from query results.
+func summarizeQueryResults(data json.RawMessage, query map[string]interface{}) string {
+	var resp struct {
+		Results []struct {
+			Bucket string                   `json:"bucket"`
+			Data   []map[string]interface{} `json:"data"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return formatJSON(data)
+	}
+
+	if len(resp.Results) == 0 || len(resp.Results[0].Data) == 0 {
+		return "No results returned.\n\n" + formatJSON(data)
+	}
+
+	metric, _ := query["metric"].(string)
+	entries := resp.Results[0].Data
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Query Results (%d rows)\n\n", len(entries)))
+
+	// Determine which value columns exist
+	type colDef struct {
+		key    string
+		header string
+	}
+	possibleCols := []colDef{
+		{"avg_bits_per_sec", "Avg bps"},
+		{"p95th_bits_per_sec", "P95 bps"},
+		{"max_bits_per_sec", "Max bps"},
+		{"avg_pkts_per_sec", "Avg pps"},
+		{"p95th_pkts_per_sec", "P95 pps"},
+		{"max_pkts_per_sec", "Max pps"},
+		{"avg_flows_per_sec", "Avg fps"},
+		{"p95th_flows_per_sec", "P95 fps"},
+		{"max_flows_per_sec", "Max fps"},
+		{"max_ips", "Max IPs"},
+	}
+
+	// Find which columns have data
+	var activeCols []colDef
+	for _, col := range possibleCols {
+		if _, ok := entries[0][col.key]; ok {
+			activeCols = append(activeCols, col)
+		}
+		if len(activeCols) >= 3 {
+			break
+		}
+	}
+
+	// Calculate totals for percentage
+	totals := make(map[string]float64)
+	for _, entry := range entries {
+		for _, col := range activeCols {
+			if v, ok := entry[col.key].(float64); ok {
+				totals[col.key] += v
+			}
+		}
+	}
+
+	// Header
+	sb.WriteString(fmt.Sprintf("| %-55s |", "Key"))
+	for _, col := range activeCols {
+		sb.WriteString(fmt.Sprintf(" %14s |", col.header))
+	}
+	if len(activeCols) > 0 {
+		sb.WriteString(fmt.Sprintf(" %8s |", "% Total"))
+	}
+	sb.WriteString("\n|")
+	sb.WriteString(strings.Repeat("-", 57) + "|")
+	for range activeCols {
+		sb.WriteString(strings.Repeat("-", 16) + "|")
+	}
+	if len(activeCols) > 0 {
+		sb.WriteString(strings.Repeat("-", 10) + "|")
+	}
+	sb.WriteString("\n")
+
+	// Rows
+	for _, entry := range entries {
+		key := fmt.Sprintf("%v", entry["key"])
+		if len(key) > 55 {
+			key = key[:52] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("| %-55s |", key))
+		for i, col := range activeCols {
+			v, _ := entry[col.key].(float64)
+			sb.WriteString(fmt.Sprintf(" %14s |", formatRate(v, metric)))
+			if i == 0 && totals[col.key] > 0 {
+				pct := v / totals[col.key] * 100
+				sb.WriteString(fmt.Sprintf(" %7.2f%% |", pct))
+			}
+		}
+		if len(activeCols) == 0 {
+			sb.WriteString("\n")
+		} else if len(activeCols) > 0 {
+			// pct already written for first col
+			if len(activeCols) > 1 {
+				// nothing extra needed, pct is after first col
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// Total row
+	sb.WriteString(fmt.Sprintf("| %-55s |", "**TOTAL**"))
+	for _, col := range activeCols {
+		sb.WriteString(fmt.Sprintf(" %14s |", formatRate(totals[col.key], metric)))
+	}
+	if len(activeCols) > 0 {
+		sb.WriteString(fmt.Sprintf(" %8s |", "100%"))
+	}
+	sb.WriteString("\n\n")
+
+	// Also include the raw JSON for detailed analysis
+	sb.WriteString("<details><summary>Raw JSON</summary>\n\n```json\n")
+	sb.WriteString(formatJSON(data))
+	sb.WriteString("\n```\n</details>\n")
+
+	return sb.String()
+}
+
+// formatRate formats a numeric rate value with appropriate units.
+func formatRate(v float64, metric string) string {
+	switch {
+	case strings.Contains(metric, "bytes") || metric == "bytes":
+		return formatBitsPerSec(v)
+	default:
+		if v >= 1e6 {
+			return fmt.Sprintf("%.2fM", v/1e6)
+		}
+		if v >= 1e3 {
+			return fmt.Sprintf("%.2fK", v/1e3)
+		}
+		return fmt.Sprintf("%.2f", v)
+	}
+}
+
+func formatBitsPerSec(bps float64) string {
+	if bps >= 1e12 {
+		return fmt.Sprintf("%.2f Tbps", bps/1e12)
+	}
+	if bps >= 1e9 {
+		return fmt.Sprintf("%.2f Gbps", bps/1e9)
+	}
+	if bps >= 1e6 {
+		return fmt.Sprintf("%.2f Mbps", bps/1e6)
+	}
+	if bps >= 1e3 {
+		return fmt.Sprintf("%.2f Kbps", bps/1e3)
+	}
+	return fmt.Sprintf("%.2f bps", bps)
 }
 
 func makeQueryURLHandler(client *kentik.Client) server.ToolHandlerFunc {

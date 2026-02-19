@@ -9,10 +9,12 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 | Tool | Description |
 |------|-------------|
 | `kentik_list_devices` | List all registered devices |
+| `kentik_search_devices` | Search/filter devices by name, site, type, or label with summarized output |
 | `kentik_get_device` | Get device details by ID |
 | `kentik_list_interfaces` | List interfaces on a device |
+| `kentik_list_all_interfaces` | List interfaces across all devices (bulk, rate-limited) |
 | `kentik_get_interface` | Get interface details |
-| `kentik_query_data` | Query network flow data (topX) with flexible dimensions, metrics, and filters |
+| `kentik_query_data` | Query flow data with convenience filters (connect type, port, ASN, IP) and auto-summarization |
 | `kentik_query_url` | Generate a Kentik portal Data Explorer URL for a query |
 | `kentik_list_synthetic_tests` | List all synthetic monitoring tests |
 | `kentik_get_synthetic_test` | Get synthetic test details |
