@@ -1,0 +1,13 @@
+# Build output
+kentik-mcp
+/kentik-mcp
+
+# IDE
+.idea/
+.vscode/mcp.json
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
