@@ -82,6 +82,9 @@ func registerQueryTools(s *server.MCPServer, client *kentik.Client) {
 		mcp.WithString("dst_as",
 			mcp.Description("Convenience filter: destination AS number."),
 		),
+		mcp.WithString("site_name",
+			mcp.Description("Convenience shortcut: auto-resolve devices by site name (e.g. 'NYC-DC1'). Searches for active devices at this site and uses them. Overrides device_name."),
+		),
 		mcp.WithString("fast_data",
 			mcp.Description("Dataset selection: Auto, Fast, or Full. Default: Auto"),
 		),
@@ -288,9 +291,28 @@ func buildFilters(request mcp.CallToolRequest) map[string]interface{} {
 
 func makeQueryDataHandler(client *kentik.Client) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Auto-resolve site_name to device names
+		var siteDeviceNames string
+		if siteName, err := request.RequireString("site_name"); err == nil && siteName != "" {
+			devNames, resolveErr := resolveDevicesBySite(client, siteName)
+			if resolveErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Failed to resolve site '%s': %v", siteName, resolveErr)), nil
+			}
+			if len(devNames) == 0 {
+				return mcp.NewToolResultError(fmt.Sprintf("No active devices found at site matching '%s'", siteName)), nil
+			}
+			siteDeviceNames = strings.Join(devNames, ",")
+		}
+
 		query, err := buildQueryObject(request)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		// Override device_name if site_name was used
+		if siteDeviceNames != "" {
+			query["device_name"] = siteDeviceNames
+			query["all_selected"] = false
 		}
 
 		body := map[string]interface{}{
@@ -309,10 +331,37 @@ func makeQueryDataHandler(client *kentik.Client) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to query data: %v", err)), nil
 		}
 
-		// Build a summary table + raw JSON
 		summary := summarizeQueryResults(data, query)
 		return mcp.NewToolResultText(summary), nil
 	}
+}
+
+// resolveDevicesBySite fetches all devices and returns names matching the site.
+func resolveDevicesBySite(client *kentik.Client, siteName string) ([]string, error) {
+	data, err := client.V5("GET", "/devices", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Devices []struct {
+			Name   string `json:"device_name"`
+			Status string `json:"device_status"`
+			Site   struct {
+				Name string `json:"site_name"`
+			} `json:"site"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	var names []string
+	siteNameLower := strings.ToLower(siteName)
+	for _, d := range resp.Devices {
+		if d.Status == "V" && strings.Contains(strings.ToLower(d.Site.Name), siteNameLower) {
+			names = append(names, d.Name)
+		}
+	}
+	return names, nil
 }
 
 // summarizeQueryResults produces a human-readable summary table from query results.
@@ -337,36 +386,68 @@ func summarizeQueryResults(data json.RawMessage, query map[string]interface{}) s
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("## Query Results (%d rows)\n\n", len(entries)))
 
-	// Determine which value columns exist
+	// Select columns based on the metric to avoid picking wrong ones
 	type colDef struct {
 		key    string
 		header string
 	}
-	possibleCols := []colDef{
-		{"avg_bits_per_sec", "Avg bps"},
-		{"p95th_bits_per_sec", "P95 bps"},
-		{"max_bits_per_sec", "Max bps"},
-		{"avg_pkts_per_sec", "Avg pps"},
-		{"p95th_pkts_per_sec", "P95 pps"},
-		{"max_pkts_per_sec", "Max pps"},
-		{"avg_flows_per_sec", "Avg fps"},
-		{"p95th_flows_per_sec", "P95 fps"},
-		{"max_flows_per_sec", "Max fps"},
-		{"max_ips", "Max IPs"},
+
+	var preferredCols []colDef
+	switch {
+	case metric == "fps":
+		preferredCols = []colDef{
+			{"avg_flows_per_sec", "Avg FPS"},
+			{"p95th_flows_per_sec", "P95 FPS"},
+			{"max_flows_per_sec", "Max FPS"},
+		}
+	case strings.Contains(metric, "packets"):
+		preferredCols = []colDef{
+			{"avg_pkts_per_sec", "Avg PPS"},
+			{"p95th_pkts_per_sec", "P95 PPS"},
+			{"max_pkts_per_sec", "Max PPS"},
+		}
+	case metric == "unique_src_ip" || metric == "unique_dst_ip":
+		preferredCols = []colDef{
+			{"max_ips", "Max IPs"},
+		}
+	default: // bytes and variants
+		preferredCols = []colDef{
+			{"avg_bits_per_sec", "Avg bps"},
+			{"p95th_bits_per_sec", "P95 bps"},
+			{"max_bits_per_sec", "Max bps"},
+		}
 	}
 
-	// Find which columns have data
+	// Only include columns that exist in the data
 	var activeCols []colDef
-	for _, col := range possibleCols {
+	for _, col := range preferredCols {
 		if _, ok := entries[0][col.key]; ok {
 			activeCols = append(activeCols, col)
 		}
-		if len(activeCols) >= 3 {
-			break
+	}
+	// Fallback: if none of preferred cols exist, pick any 3 that do
+	if len(activeCols) == 0 {
+		allCols := []colDef{
+			{"avg_bits_per_sec", "Avg bps"}, {"p95th_bits_per_sec", "P95 bps"}, {"max_bits_per_sec", "Max bps"},
+			{"avg_pkts_per_sec", "Avg PPS"}, {"avg_flows_per_sec", "Avg FPS"}, {"max_ips", "Max IPs"},
+		}
+		for _, col := range allCols {
+			if _, ok := entries[0][col.key]; ok {
+				activeCols = append(activeCols, col)
+				if len(activeCols) >= 3 {
+					break
+				}
+			}
 		}
 	}
 
-	// Calculate totals for percentage
+	// The first active column is used for percentages
+	sortCol := ""
+	if len(activeCols) > 0 {
+		sortCol = activeCols[0].key
+	}
+
+	// Calculate totals
 	totals := make(map[string]float64)
 	for _, entry := range entries {
 		for _, col := range activeCols {
@@ -377,22 +458,16 @@ func summarizeQueryResults(data json.RawMessage, query map[string]interface{}) s
 	}
 
 	// Header
-	sb.WriteString(fmt.Sprintf("| %-55s |", "Key"))
+	sb.WriteString(fmt.Sprintf("| %-55s", "Key"))
 	for _, col := range activeCols {
-		sb.WriteString(fmt.Sprintf(" %14s |", col.header))
+		sb.WriteString(fmt.Sprintf(" | %14s", col.header))
 	}
-	if len(activeCols) > 0 {
-		sb.WriteString(fmt.Sprintf(" %8s |", "% Total"))
-	}
-	sb.WriteString("\n|")
-	sb.WriteString(strings.Repeat("-", 57) + "|")
+	sb.WriteString(" | % Total |\n")
+	sb.WriteString("|" + strings.Repeat("-", 56))
 	for range activeCols {
-		sb.WriteString(strings.Repeat("-", 16) + "|")
+		sb.WriteString("|" + strings.Repeat("-", 16))
 	}
-	if len(activeCols) > 0 {
-		sb.WriteString(strings.Repeat("-", 10) + "|")
-	}
-	sb.WriteString("\n")
+	sb.WriteString("|---------|\n")
 
 	// Rows
 	for _, entry := range entries {
@@ -400,37 +475,30 @@ func summarizeQueryResults(data json.RawMessage, query map[string]interface{}) s
 		if len(key) > 55 {
 			key = key[:52] + "..."
 		}
-		sb.WriteString(fmt.Sprintf("| %-55s |", key))
-		for i, col := range activeCols {
+		sb.WriteString(fmt.Sprintf("| %-55s", key))
+		for _, col := range activeCols {
 			v, _ := entry[col.key].(float64)
-			sb.WriteString(fmt.Sprintf(" %14s |", formatRate(v, metric)))
-			if i == 0 && totals[col.key] > 0 {
-				pct := v / totals[col.key] * 100
-				sb.WriteString(fmt.Sprintf(" %7.2f%% |", pct))
-			}
+			sb.WriteString(fmt.Sprintf(" | %14s", formatRate(v, metric)))
 		}
-		if len(activeCols) == 0 {
-			sb.WriteString("\n")
-		} else if len(activeCols) > 0 {
-			// pct already written for first col
-			if len(activeCols) > 1 {
-				// nothing extra needed, pct is after first col
-			}
-			sb.WriteString("\n")
+		// Percentage based on first column
+		if sortCol != "" && totals[sortCol] > 0 {
+			v, _ := entry[sortCol].(float64)
+			pct := v / totals[sortCol] * 100
+			sb.WriteString(fmt.Sprintf(" | %6.2f%% |", pct))
+		} else {
+			sb.WriteString(" |         |")
 		}
+		sb.WriteString("\n")
 	}
 
 	// Total row
-	sb.WriteString(fmt.Sprintf("| %-55s |", "**TOTAL**"))
+	sb.WriteString(fmt.Sprintf("| %-55s", "**TOTAL**"))
 	for _, col := range activeCols {
-		sb.WriteString(fmt.Sprintf(" %14s |", formatRate(totals[col.key], metric)))
+		sb.WriteString(fmt.Sprintf(" | %14s", formatRate(totals[col.key], metric)))
 	}
-	if len(activeCols) > 0 {
-		sb.WriteString(fmt.Sprintf(" %8s |", "100%"))
-	}
-	sb.WriteString("\n\n")
+	sb.WriteString(" |  100.0% |\n\n")
 
-	// Also include the raw JSON for detailed analysis
+	// Raw JSON in collapsible
 	sb.WriteString("<details><summary>Raw JSON</summary>\n\n```json\n")
 	sb.WriteString(formatJSON(data))
 	sb.WriteString("\n```\n</details>\n")

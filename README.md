@@ -120,10 +120,11 @@ The server communicates over stdio using the MCP protocol.
 
 Once connected, you can ask your LLM things like:
 
-- "List all my Kentik devices"
-- "Show me the top 10 source IPs by traffic in the last hour"
+- "Search for border routers in the NYC site"
+- "Show me the top 10 destination ASNs by traffic on PNI links in the last 24 hours"
+- "What's the traffic breakdown by port on external links (PNI + transit + IX)?"
+- "Query flows per second by destination port, filtered to transit links"
 - "What synthetic tests are configured?"
-- "Get the results for synthetic test 12345 from the last 24 hours"
 - "Ask Kentik AI: How are my devices doing?"
 - "Which sites have the most devices?"
 
